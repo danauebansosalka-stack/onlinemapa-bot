@@ -1,11 +1,12 @@
 
-
+import asyncio
+import json
+import logging
 import os
 import re
-import asyncio
-import logging
-import aiohttp
+from pathlib import Path
 
+import aiohttp
 from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import (
@@ -15,183 +16,363 @@ from telegram.ext import (
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_URL = "https://t.me/s/eyes_everywhere_ua"
-POLL_SECONDS = 30
+
+CHANNELS = [
+    "eyes_everywhere_ua",
+    "monitorsmy",
+]
+
+CHECK_INTERVAL = 30
+STATE_FILE = Path("bot_state.json")
+MAX_SEEN_POSTS = 2000
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 subscribers = set()
-seen_ids = set()
-initialized = False
+seen_posts = set()
+http_session = None
+monitor_task = None
+application = None
 
-KEYWORD_PATTERNS = [
-    ("КАБ", r"\bкаб\w*\b"),
-    ("Веселянка", r"веселянк\w*"),
-    ("Малокатеринівка", r"малокатеринівк\w*"),
-    ("Кушугум", r"кушугум\w*"),
-    ("Балабино", r"балабин\w*"),
-    ("Кічкас", r"кічкас|кичкас|кічман|кичман"),
-    ("Заводской", r"заводськ\w*|заводск\w*"),
-    ("Шахед", r"\bшахед\w*\b"),
-    ("БПЛА", r"\bбпла\b|беспилотник\w*"),
-    ("FPV", r"\bfpv\b"),
-    ("Баллистика", r"баллистик\w*"),
-    ("РСЗО", r"\bрсзо\b"),
-    ("Снаряд", r"снаряд\w*"),
+
+# Шукаємо лише явне текстове зазначення напрямку.
+# Це НЕ перевіряє справжню траєкторію цілі.
+DIRECTION_PATTERN = re.compile(
+    r"(?:"
+    r"(?:у|в)\s+напрям(?:ку|ок)\s+(?:на\s+)?запоріжжя"
+    r"|(?:у|в)\s+бік\s+запоріжжя"
+    r"|курс\s+на\s+запоріжжя"
+    r"|на\s+запоріжжя"
+    r")",
+    re.IGNORECASE,
+)
+
+TARGET_PATTERNS = [
+    (
+        "УМПБ-5",
+        re.compile(r"УМПБ[\s\-‐‑‒–—]*5", re.IGNORECASE),
+    ),
+    (
+        "реактивний «Шахед»",
+        re.compile(
+            r"(?:реактивн\w*.{0,30}(?:шахед|герань)"
+            r"|(?:шахед|герань).{0,30}реактивн\w*)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "«Шахед»",
+        re.compile(r"шахед\w*|shahed\w*", re.IGNORECASE),
+    ),
+    (
+        "БпЛА",
+        re.compile(
+            r"\bБпЛА\b|безпілотник\w*|беспилотник\w*",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "КАБ",
+        re.compile(r"\bКАБ\w*\b", re.IGNORECASE),
+    ),
+    (
+        "FPV",
+        re.compile(r"\bFPV\b", re.IGNORECASE),
+    ),
+    (
+        "балістика",
+        re.compile(r"балістик\w*|баллистик\w*", re.IGNORECASE),
+    ),
+    (
+        "РСЗВ",
+        re.compile(r"\bРСЗВ\b|\bРСЗО\b", re.IGNORECASE),
+    ),
+    (
+        "ракета",
+        re.compile(r"ракет\w*", re.IGNORECASE),
+    ),
+    (
+        "снаряд",
+        re.compile(r"снаряд\w*", re.IGNORECASE),
+    ),
+    (
+        "«Бандероль»",
+        re.compile(r"бандерол\w*", re.IGNORECASE),
+    ),
+    (
+        "«Молнія»",
+        re.compile(r"молні\w*|молни\w*", re.IGNORECASE),
+    ),
 ]
 
-
-def find_matches(text):
-    normalized = text.casefold().replace("ё", "е")
-    return [
-        label
-        for label, pattern in KEYWORD_PATTERNS
-        if re.search(pattern, normalized, re.IGNORECASE)
-    ]
+TARGET_WORD_PATTERN = re.compile(
+    r"\bціл(?:ь|і|ей|ями|ях|лю)\b",
+    re.IGNORECASE,
+)
 
 
-async def fetch_posts():
-    timeout = aiohttp.ClientTimeout(total=20)
-    headers = {"User-Agent": "Mozilla/5.0"}
+def detect_target(text):
+    """Визначає згаданий тип за текстом, а не підтверджену загрозу."""
+    for name, pattern in TARGET_PATTERNS:
+        if pattern.search(text):
+            return name
 
-    async with aiohttp.ClientSession(
-        timeout=timeout,
-        headers=headers,
-    ) as session:
-        async with session.get(CHANNEL_URL) as response:
-            response.raise_for_status()
+    if TARGET_WORD_PATTERN.search(text):
+        return "невизначена ціль"
+
+    return None
+
+
+def direction_is_explicit(text):
+    """Не вгадує напрямок за назвами інших населених пунктів."""
+    return bool(DIRECTION_PATTERN.search(text))
+
+
+def make_alert(text):
+    # Спочатку потрібне явне текстове зазначення напрямку.
+    if not direction_is_explicit(text):
+        return None
+
+    target = detect_target(text)
+    if not target:
+        return None
+
+    if target == "УМПБ-5":
+        headline = (
+            "⚠️ У повідомленні згадується УМПБ-5 "
+            "(можливе застосування реактивних КАБ)."
+        )
+    elif target == "невизначена ціль":
+        headline = (
+            "⚠️ У повідомленні згадується ціль, "
+            "але її тип не визначено."
+        )
+    else:
+        headline = f"⚠️ У повідомленні згадується: {target}."
+
+    return (
+        "⚡ ЗАПОРІЖЖЯ | СИГНАЛ\n\n"
+        f"{headline}\n"
+        "📍 У тексті повідомлення зазначено напрямок на Запоріжжя.\n\n"
+        "⚠️ Автоматичний збіг тексту не підтверджує "
+        "реальну траєкторію чи наявність загрози.\n"
+        "📢 Перевіряйте офіційні сповіщення та "
+        "дотримуйтеся вказівок щодо укриття."
+    )
+
+
+def load_state():
+    global subscribers, seen_posts
+
+    try:
+        if STATE_FILE.exists():
+            data = json.loads(
+                STATE_FILE.read_text(encoding="utf-8")
+            )
+            subscribers = set(data.get("subscribers", []))
+            seen_posts = set(data.get("seen_posts", []))
+    except Exception:
+        logger.exception("Не вдалося завантажити стан")
+
+
+def save_state():
+    try:
+        data = {
+            "subscribers": list(subscribers),
+            "seen_posts": list(seen_posts)[-MAX_SEEN_POSTS:],
+        }
+        STATE_FILE.write_text(
+            json.dumps(data, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.exception("Не вдалося зберегти стан")
+
+
+async def fetch_channel(channel):
+    url = f"https://t.me/s/{channel}"
+
+    try:
+        async with http_session.get(
+            url,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as response:
+            if response.status != 200:
+                logger.warning(
+                    "Канал %s: HTTP %s",
+                    channel,
+                    response.status,
+                )
+                return []
+
             html = await response.text()
+
+    except Exception:
+        logger.exception("Помилка читання каналу %s", channel)
+        return []
 
     soup = BeautifulSoup(html, "html.parser")
     posts = []
 
-    for item in soup.select(".tgme_widget_message"):
-        post_id = item.get("data-post")
-        text_element = item.select_one(
-            ".tgme_widget_message_text"
-        )
+    for wrap in soup.select(".tgme_widget_message_wrap"):
+        message = wrap.select_one(".tgme_widget_message")
+        text_node = wrap.select_one(".tgme_widget_message_text")
 
-        if not post_id or not text_element:
+        if not message or not text_node:
             continue
 
-        text = text_element.get_text(" ", strip=True)
-        if text:
+        post_id = message.get("data-post")
+        text = text_node.get_text(" ", strip=True)
+
+        if post_id and text:
             posts.append((post_id, text))
 
     return posts
 
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    message = update.effective_message
-    user = update.effective_user
+async def notify_subscribers(message):
+    for chat_id in list(subscribers):
+        try:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+            )
+        except Exception:
+            logger.exception(
+                "Не вдалося надіслати повідомлення: %s",
+                chat_id,
+            )
 
-    if not message or not user:
-        return
-
-    subscribers.add(user.id)
-    await message.reply_text(
-        "Бот запущен.\n"
-        "Отслеживаются ключевые слова в публичной ленте.\n"
-        f"Интервал проверки: {POLL_SECONDS} секунд.\n"
-        "Совпадение слов не подтверждает наличие угрозы."
-    )
+        await asyncio.sleep(0.05)
 
 
-async def status(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    message = update.effective_message
-    if not message:
-        return
-
-    await message.reply_text(
-        "Бот работает, если сервис запущен.\n"
-        f"Интервал проверки: {POLL_SECONDS} секунд.\n"
-        f"Подписчиков в текущем запуске: {len(subscribers)}"
-    )
-
-
-async def monitor_channel(application):
-    global initialized
+async def monitor_loop():
+    first_run = not seen_posts
 
     while True:
         try:
-            posts = await fetch_posts()
+            for channel in CHANNELS:
+                posts = await fetch_channel(channel)
 
-            if not initialized:
-                seen_ids.update(post_id for post_id, _ in posts)
-                initialized = True
-                logger.info("Начальная загрузка завершена.")
-            else:
                 for post_id, text in posts:
-                    if post_id in seen_ids:
+                    unique_id = f"{channel}:{post_id}"
+
+                    if unique_id in seen_posts:
                         continue
 
-                    seen_ids.add(post_id)
-                    matches = find_matches(text)
+                    # Позначаємо допис як переглянутий,
+                    # навіть якщо він не пройшов фільтр.
+                    seen_posts.add(unique_id)
 
-                    if matches:
-                        notification = (
-                            "📢 Найдены ключевые слова\n\n"
-                            f"Совпадения: {', '.join(matches)}\n\n"
-                            f"Текст публикации:\n{text[:3000]}\n\n"
-                            "Совпадение текста не подтверждает угрозу."
-                        )
+                    if not first_run:
+                        alert = make_alert(text)
+                        if alert:
+                            await notify_subscribers(alert)
 
-                        for user_id in list(subscribers):
-                            try:
-                                await application.bot.send_message(
-                                    chat_id=user_id,
-                                    text=notification,
-                                )
-                            except Exception:
-                                logger.exception(
-                                    "Ошибка отправки уведомления."
-                                )
+                # Обмежуємо пам'ять про переглянуті дописи.
+                seen_posts_list = list(seen_posts)
+                if len(seen_posts_list) > MAX_SEEN_POSTS:
+                    seen_posts.clear()
+                    seen_posts.update(
+                        seen_posts_list[-MAX_SEEN_POSTS:]
+                    )
 
-            if len(seen_ids) > 1000:
-                seen_ids.clear()
-                seen_ids.update(post_id for post_id, _ in posts)
+                save_state()
+
+            first_run = False
 
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Ошибка чтения публичной ленты.")
+            logger.exception("Помилка моніторингу")
 
-        await asyncio.sleep(POLL_SECONDS)
+        await asyncio.sleep(CHECK_INTERVAL)
 
 
-async def post_init(application):
-    application.bot_data["monitor_task"] = asyncio.create_task(
-        monitor_channel(application)
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    subscribers.add(update.effective_chat.id)
+    save_state()
+
+    await update.effective_message.reply_text(
+        "⚡ ЗАПОРІЖЖЯ | СИГНАЛ\n\n"
+        "🟢 Сповіщення увімкнено.\n"
+        "📡 Перевірка відкритих джерел кожні 30 секунд.\n\n"
+        "/start — увімкнути сповіщення\n"
+        "/stop — вимкнути сповіщення\n"
+        "/status — стан бота\n\n"
+        "⚠️ Бот не є офіційним джерелом. "
+        "Автоматичні збіги можуть бути помилковими.\n"
+        "🇺🇦 Бережіть себе!"
     )
 
 
-async def post_shutdown(application):
-    task = application.bot_data.get("monitor_task")
-    if task:
-        task.cancel()
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    subscribers.discard(update.effective_chat.id)
+    save_state()
+
+    await update.effective_message.reply_text(
+        "🔕 Сповіщення вимкнено.\n"
+        "Для повторного ввімкнення надішліть /start."
+    )
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "⚡ ЗАПОРІЖЖЯ | СИГНАЛ\n\n"
+        "🟢 Бот працює.\n"
+        "🔄 Інтервал перевірки: 30 секунд.\n"
+        f"📡 Джерел у списку: {len(CHANNELS)}.\n\n"
+        "ℹ️ Робота бота не підтверджує наявність "
+        "або відсутність загрози.\n"
+        "Перевіряйте офіційні сповіщення."
+    )
+
+
+async def post_init(app: Application):
+    global http_session, monitor_task, application
+
+    application = app
+    load_state()
+
+    http_session = aiohttp.ClientSession(
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
+        }
+    )
+
+    monitor_task = asyncio.create_task(monitor_loop())
+    logger.info("Бот запущено")
+
+
+async def post_shutdown(app: Application):
+    global http_session, monitor_task
+
+    if monitor_task:
+        monitor_task.cancel()
         try:
-            await task
+            await monitor_task
         except asyncio.CancelledError:
             pass
+
+    if http_session:
+        await http_session.close()
+
+    save_state()
+    logger.info("Бот зупинено")
 
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError(
-            "Не задан BOT_TOKEN в Environment Variables."
+            "Не задано BOT_TOKEN у змінних середовища Render."
         )
 
-    application = (
+    app = (
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
@@ -199,11 +380,11 @@ def main():
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(CommandHandler("status", status_command))
 
-    logger.info("Запуск Telegram-бота.")
-    application.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
