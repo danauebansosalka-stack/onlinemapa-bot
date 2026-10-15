@@ -1,4 +1,5 @@
 
+
 import os
 import re
 import asyncio
@@ -13,7 +14,6 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# Настройки
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHANNEL_URL = "https://t.me/s/eyes_everywhere_ua"
 POLL_SECONDS = 30
@@ -28,37 +28,35 @@ subscribers = set()
 seen_ids = set()
 initialized = False
 
-THREAT_PATTERNS = [
-    ("Реактивный шахед", r"реактивн\w*\s+шахед\w*"),
-    ("Шахед", r"\bшахед\w*\b|\bshahed\w*\b"),
-    ("БПЛА", r"\bбпла\b|\bбеспилотник\w*\b"),
+KEYWORD_PATTERNS = [
+    ("КАБ", r"\bкаб\w*\b"),
+    ("Веселянка", r"веселянк\w*"),
+    ("Малокатеринівка", r"малокатеринівк\w*"),
+    ("Кушугум", r"кушугум\w*"),
+    ("Балабино", r"балабин\w*"),
+    ("Кічкас", r"кічкас|кичкас|кічман|кичман"),
+    ("Заводской", r"заводськ\w*|заводск\w*"),
+    ("Шахед", r"\bшахед\w*\b"),
+    ("БПЛА", r"\bбпла\b|беспилотник\w*"),
     ("FPV", r"\bfpv\b"),
-    ("КАБ", r"\bкаб(?:ы|ов|ами)?\b"),
-    ("Баллистика", r"\bбаллистик\w*\b"),
+    ("Баллистика", r"баллистик\w*"),
     ("РСЗО", r"\bрсзо\b"),
-    ("Снаряд", r"\bснаряд\w*\b"),
-]
-
-AREA_PATTERNS = [
-    ("Кічкас", r"кичкас|кичман|кічкас|кічман"),
-    ("Заводской", r"заводск\w*|заводськ\w*|\bзаводи\b"),
+    ("Снаряд", r"снаряд\w*"),
 ]
 
 
-def find_matches(text, patterns):
+def find_matches(text):
     normalized = text.casefold().replace("ё", "е")
     return [
         label
-        for label, pattern in patterns
+        for label, pattern in KEYWORD_PATTERNS
         if re.search(pattern, normalized, re.IGNORECASE)
     ]
 
 
 async def fetch_posts():
     timeout = aiohttp.ClientTimeout(total=20)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; PublicFeedMonitor/1.0)"
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
 
     async with aiohttp.ClientSession(
         timeout=timeout,
@@ -87,41 +85,22 @@ async def fetch_posts():
     return posts
 
 
-def make_alert(threat, areas, post_id):
-    area_text = ", ".join(areas)
-    post_url = f"https://t.me/{post_id}"
-
-    return (
-        "🔴 УВЕДОМЛЕНИЕ О ВОЗДУШНОЙ УГРОЗЕ\n\n"
-        f"Тип: {threat}\n"
-        f"Упомянутый район: {area_text}\n\n"
-        f"Источник: {post_url}\n\n"
-        "Совпадение найдено в тексте одной публикации.\n"
-        "Направление и реальное местоположение цели "
-        "не определяются.\n"
-        "Сверяйтесь с официальными оповещениями."
-    )
-
-
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    user = update.effective_user
     message = update.effective_message
+    user = update.effective_user
 
-    if not user or not message:
+    if not message or not user:
         return
 
     subscribers.add(user.id)
     await message.reply_text(
-        "✅ Бот запущен.\n\n"
-        "Источник: публичная лента канала.\n"
-        f"Проверка примерно каждые {POLL_SECONDS} секунд.\n"
-        "Уведомление отправляется, если в одной публикации "
-        "есть тип угрозы и упоминание Кичкаса или Заводского.\n\n"
-        "Команда проверки: /status\n"
-        "Полнота и своевременность уведомлений не гарантируются."
+        "Бот запущен.\n"
+        "Отслеживаются ключевые слова в публичной ленте.\n"
+        f"Интервал проверки: {POLL_SECONDS} секунд.\n"
+        "Совпадение слов не подтверждает наличие угрозы."
     )
 
 
@@ -134,26 +113,10 @@ async def status(
         return
 
     await message.reply_text(
-        "Статус: бот отвечает на команды.\n"
-        f"Источник: {CHANNEL_URL}\n"
+        "Бот работает, если сервис запущен.\n"
         f"Интервал проверки: {POLL_SECONDS} секунд.\n"
-        f"Подписчиков в текущем запуске: {len(subscribers)}\n"
-        "Публичная лента может быть недоступна."
+        f"Подписчиков в текущем запуске: {len(subscribers)}"
     )
-
-
-async def send_alert(application, text):
-    for user_id in list(subscribers):
-        try:
-            await application.bot.send_message(
-                chat_id=user_id,
-                text=text,
-            )
-        except Exception:
-            logger.exception(
-                "Не удалось отправить уведомление пользователю %s",
-                user_id,
-            )
 
 
 async def monitor_channel(application):
@@ -163,51 +126,45 @@ async def monitor_channel(application):
         try:
             posts = await fetch_posts()
 
-            if not posts:
-                logger.info("В публичной ленте нет публикаций.")
-                await asyncio.sleep(POLL_SECONDS)
-                continue
-
             if not initialized:
-                for post_id, _ in posts:
-                    seen_ids.add(post_id)
-
+                seen_ids.update(post_id for post_id, _ in posts)
                 initialized = True
-                logger.info(
-                    "Начальная загрузка завершена. Публикаций: %s",
-                    len(seen_ids),
-                )
-                await asyncio.sleep(POLL_SECONDS)
-                continue
+                logger.info("Начальная загрузка завершена.")
+            else:
+                for post_id, text in posts:
+                    if post_id in seen_ids:
+                        continue
 
-            new_posts = [
-                (post_id, text)
-                for post_id, text in posts
-                if post_id not in seen_ids
-            ]
+                    seen_ids.add(post_id)
+                    matches = find_matches(text)
 
-            for post_id, text in new_posts:
-                seen_ids.add(post_id)
-                threats = find_matches(text, THREAT_PATTERNS)
-                areas = find_matches(text, AREA_PATTERNS)
+                    if matches:
+                        notification = (
+                            "📢 Найдены ключевые слова\n\n"
+                            f"Совпадения: {', '.join(matches)}\n\n"
+                            f"Текст публикации:\n{text[:3000]}\n\n"
+                            "Совпадение текста не подтверждает угрозу."
+                        )
 
-                if threats and areas:
-                    await send_alert(
-                        application,
-                        make_alert(threats[0], areas, post_id),
-                    )
+                        for user_id in list(subscribers):
+                            try:
+                                await application.bot.send_message(
+                                    chat_id=user_id,
+                                    text=notification,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Ошибка отправки уведомления."
+                                )
 
             if len(seen_ids) > 1000:
                 seen_ids.clear()
-                for post_id, _ in posts:
-                    seen_ids.add(post_id)
+                seen_ids.update(post_id for post_id, _ in posts)
 
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception(
-                "Ошибка проверки ленты. Повторная попытка позже."
-            )
+            logger.exception("Ошибка чтения публичной ленты.")
 
         await asyncio.sleep(POLL_SECONDS)
 
@@ -231,7 +188,7 @@ async def post_shutdown(application):
 def main():
     if not BOT_TOKEN:
         raise RuntimeError(
-            "Не задан BOT_TOKEN. Добавьте токен в Environment Variables."
+            "Не задан BOT_TOKEN в Environment Variables."
         )
 
     application = (
