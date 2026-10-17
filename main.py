@@ -7,13 +7,10 @@ import re
 from pathlib import Path
 
 import aiohttp
+from aiohttp import web
 from bs4 import BeautifulSoup
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
@@ -23,6 +20,7 @@ CHANNELS = [
 ]
 
 CHECK_INTERVAL = 30
+PORT = int(os.environ.get("PORT", "10000"))
 STATE_FILE = Path("bot_state.json")
 MAX_SEEN_POSTS = 2000
 
@@ -36,11 +34,42 @@ subscribers = set()
 seen_posts = set()
 http_session = None
 monitor_task = None
+web_runner = None
 application = None
+started_at = None
 
 
-# Шукаємо лише явне текстове зазначення напрямку.
-# Це НЕ перевіряє справжню траєкторію цілі.
+TARGET_PATTERNS = [
+    ("УМПБ-5", r"УМПБ[\s\-‐‑‒–—]*5"),
+    (
+        "реактивний «Шахед»",
+        r"(?:реактивн\w*.{0,30}(?:шахед|герань)|"
+        r"(?:шахед|герань).{0,30}реактивн\w*)",
+    ),
+    ("«Шахед»", r"шахед\w*|shahed\w*"),
+    ("БпЛА", r"\bБпЛА\b|безпілотник\w*|беспилотник\w*"),
+    ("КАБ", r"\bКАБ\w*\b"),
+    ("FPV", r"\bFPV\b"),
+    ("балістика", r"балістик\w*|баллистик\w*"),
+    ("РСЗВ", r"\bРСЗВ\b|\bРСЗО\b"),
+    ("ракета", r"ракет\w*"),
+    ("снаряд", r"снаряд\w*"),
+    ("«Бандероль»", r"бандерол\w*"),
+    ("«Молнія»", r"молні\w*|молни\w*"),
+]
+
+COMPILED_TARGETS = [
+    (name, re.compile(pattern, re.IGNORECASE))
+    for name, pattern in TARGET_PATTERNS
+]
+
+TARGET_WORD_PATTERN = re.compile(
+    r"\bціл(?:ь|і|ей|ями|ях|лю)\b",
+    re.IGNORECASE,
+)
+
+# Це лише перевірка явної фрази в тексті.
+# Вона не визначає справжню траєкторію.
 DIRECTION_PATTERN = re.compile(
     r"(?:"
     r"(?:у|в)\s+напрям(?:ку|ок)\s+(?:на\s+)?запоріжжя"
@@ -50,119 +79,6 @@ DIRECTION_PATTERN = re.compile(
     r")",
     re.IGNORECASE,
 )
-
-TARGET_PATTERNS = [
-    (
-        "УМПБ-5",
-        re.compile(r"УМПБ[\s\-‐‑‒–—]*5", re.IGNORECASE),
-    ),
-    (
-        "реактивний «Шахед»",
-        re.compile(
-            r"(?:реактивн\w*.{0,30}(?:шахед|герань)"
-            r"|(?:шахед|герань).{0,30}реактивн\w*)",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "«Шахед»",
-        re.compile(r"шахед\w*|shahed\w*", re.IGNORECASE),
-    ),
-    (
-        "БпЛА",
-        re.compile(
-            r"\bБпЛА\b|безпілотник\w*|беспилотник\w*",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "КАБ",
-        re.compile(r"\bКАБ\w*\b", re.IGNORECASE),
-    ),
-    (
-        "FPV",
-        re.compile(r"\bFPV\b", re.IGNORECASE),
-    ),
-    (
-        "балістика",
-        re.compile(r"балістик\w*|баллистик\w*", re.IGNORECASE),
-    ),
-    (
-        "РСЗВ",
-        re.compile(r"\bРСЗВ\b|\bРСЗО\b", re.IGNORECASE),
-    ),
-    (
-        "ракета",
-        re.compile(r"ракет\w*", re.IGNORECASE),
-    ),
-    (
-        "снаряд",
-        re.compile(r"снаряд\w*", re.IGNORECASE),
-    ),
-    (
-        "«Бандероль»",
-        re.compile(r"бандерол\w*", re.IGNORECASE),
-    ),
-    (
-        "«Молнія»",
-        re.compile(r"молні\w*|молни\w*", re.IGNORECASE),
-    ),
-]
-
-TARGET_WORD_PATTERN = re.compile(
-    r"\bціл(?:ь|і|ей|ями|ях|лю)\b",
-    re.IGNORECASE,
-)
-
-
-def detect_target(text):
-    """Визначає згаданий тип за текстом, а не підтверджену загрозу."""
-    for name, pattern in TARGET_PATTERNS:
-        if pattern.search(text):
-            return name
-
-    if TARGET_WORD_PATTERN.search(text):
-        return "невизначена ціль"
-
-    return None
-
-
-def direction_is_explicit(text):
-    """Не вгадує напрямок за назвами інших населених пунктів."""
-    return bool(DIRECTION_PATTERN.search(text))
-
-
-def make_alert(text):
-    # Спочатку потрібне явне текстове зазначення напрямку.
-    if not direction_is_explicit(text):
-        return None
-
-    target = detect_target(text)
-    if not target:
-        return None
-
-    if target == "УМПБ-5":
-        headline = (
-            "⚠️ У повідомленні згадується УМПБ-5 "
-            "(можливе застосування реактивних КАБ)."
-        )
-    elif target == "невизначена ціль":
-        headline = (
-            "⚠️ У повідомленні згадується ціль, "
-            "але її тип не визначено."
-        )
-    else:
-        headline = f"⚠️ У повідомленні згадується: {target}."
-
-    return (
-        "⚡ ЗАПОРІЖЖЯ | СИГНАЛ\n\n"
-        f"{headline}\n"
-        "📍 У тексті повідомлення зазначено напрямок на Запоріжжя.\n\n"
-        "⚠️ Автоматичний збіг тексту не підтверджує "
-        "реальну траєкторію чи наявність загрози.\n"
-        "📢 Перевіряйте офіційні сповіщення та "
-        "дотримуйтеся вказівок щодо укриття."
-    )
 
 
 def load_state():
@@ -191,6 +107,51 @@ def save_state():
         )
     except Exception:
         logger.exception("Не вдалося зберегти стан")
+
+
+def detect_target(text):
+    for name, pattern in COMPILED_TARGETS:
+        if pattern.search(text):
+            return name
+
+    if TARGET_WORD_PATTERN.search(text):
+        return "невизначена ціль"
+
+    return None
+
+
+def make_alert(text):
+    # Не надсилаємо сповіщення без явної фрази
+    # про напрямок на Запоріжжя.
+    if not DIRECTION_PATTERN.search(text):
+        return None
+
+    target = detect_target(text)
+    if not target:
+        return None
+
+    if target == "УМПБ-5":
+        headline = (
+            "⚠️ У повідомленні згадується можливе "
+            "застосування УМПБ-5 (реактивних КАБ)."
+        )
+    elif target == "невизначена ціль":
+        headline = (
+            "⚠️ У повідомленні згадується ціль, "
+            "але її тип не визначено."
+        )
+    else:
+        headline = f"⚠️ У повідомленні згадується: {target}."
+
+    return (
+        "⚡ ЗАПОРІЖЖЯ | СИГНАЛ\n\n"
+        f"{headline}\n"
+        "📍 У тексті згадується напрямок на Запоріжжя.\n\n"
+        "⚠️ Це автоматичний збіг тексту, а не підтвердження "
+        "реальної траєкторії чи загрози.\n"
+        "📢 Перевіряйте офіційні сповіщення та "
+        "дотримуйтеся вказівок щодо укриття."
+    )
 
 
 async def fetch_channel(channel):
@@ -243,7 +204,7 @@ async def notify_subscribers(message):
             )
         except Exception:
             logger.exception(
-                "Не вдалося надіслати повідомлення: %s",
+                "Помилка надсилання користувачу %s",
                 chat_id,
             )
 
@@ -264,8 +225,6 @@ async def monitor_loop():
                     if unique_id in seen_posts:
                         continue
 
-                    # Позначаємо допис як переглянутий,
-                    # навіть якщо він не пройшов фільтр.
                     seen_posts.add(unique_id)
 
                     if not first_run:
@@ -273,12 +232,11 @@ async def monitor_loop():
                         if alert:
                             await notify_subscribers(alert)
 
-                # Обмежуємо пам'ять про переглянуті дописи.
-                seen_posts_list = list(seen_posts)
-                if len(seen_posts_list) > MAX_SEEN_POSTS:
+                if len(seen_posts) > MAX_SEEN_POSTS:
+                    seen_posts_copy = list(seen_posts)
                     seen_posts.clear()
                     seen_posts.update(
-                        seen_posts_list[-MAX_SEEN_POSTS:]
+                        seen_posts_copy[-MAX_SEEN_POSTS:]
                     )
 
                 save_state()
@@ -288,19 +246,38 @@ async def monitor_loop():
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Помилка моніторингу")
+            logger.exception("Помилка циклу моніторингу")
 
         await asyncio.sleep(CHECK_INTERVAL)
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def home(request):
+    return web.Response(
+        text="ЗАПОРІЖЖЯ | СИГНАЛ — HTTP OK",
+        content_type="text/plain",
+    )
+
+
+async def health(request):
+    return web.json_response({
+        "status": "ok",
+        "service": "ЗАПОРІЖЖЯ | СИГНАЛ",
+        "monitor_interval_seconds": CHECK_INTERVAL,
+    })
+
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     subscribers.add(update.effective_chat.id)
     save_state()
 
     await update.effective_message.reply_text(
         "⚡ ЗАПОРІЖЖЯ | СИГНАЛ\n\n"
         "🟢 Сповіщення увімкнено.\n"
-        "📡 Перевірка відкритих джерел кожні 30 секунд.\n\n"
+        "📡 Моніторинг відкритих джерел.\n"
+        "🔄 Перевірка кожні 30 секунд.\n\n"
         "/start — увімкнути сповіщення\n"
         "/stop — вимкнути сповіщення\n"
         "/status — стан бота\n\n"
@@ -310,7 +287,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     subscribers.discard(update.effective_chat.id)
     save_state()
 
@@ -320,20 +300,24 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     await update.effective_message.reply_text(
         "⚡ ЗАПОРІЖЖЯ | СИГНАЛ\n\n"
         "🟢 Бот працює.\n"
-        "🔄 Інтервал перевірки: 30 секунд.\n"
+        "🌐 HTTP-сервер увімкнено.\n"
+        f"🔄 Інтервал перевірки: {CHECK_INTERVAL} секунд.\n"
         f"📡 Джерел у списку: {len(CHANNELS)}.\n\n"
-        "ℹ️ Робота бота не підтверджує наявність "
+        "⚠️ Статус бота не підтверджує наявність "
         "або відсутність загрози.\n"
         "Перевіряйте офіційні сповіщення."
     )
 
 
 async def post_init(app: Application):
-    global http_session, monitor_task, application
+    global http_session, monitor_task, web_runner, application
 
     application = app
     load_state()
@@ -345,12 +329,22 @@ async def post_init(app: Application):
         }
     )
 
+    http_app = web.Application()
+    http_app.router.add_get("/", home)
+    http_app.router.add_get("/health", health)
+
+    web_runner = web.AppRunner(http_app)
+    await web_runner.setup()
+
+    site = web.TCPSite(web_runner, "0.0.0.0", PORT)
+    await site.start()
+
     monitor_task = asyncio.create_task(monitor_loop())
-    logger.info("Бот запущено")
+    logger.info("Бот та HTTP-сервер запущені на порту %s", PORT)
 
 
 async def post_shutdown(app: Application):
-    global http_session, monitor_task
+    global http_session, monitor_task, web_runner
 
     if monitor_task:
         monitor_task.cancel()
@@ -362,8 +356,11 @@ async def post_shutdown(app: Application):
     if http_session:
         await http_session.close()
 
+    if web_runner:
+        await web_runner.cleanup()
+
     save_state()
-    logger.info("Бот зупинено")
+    logger.info("Бот та HTTP-сервер зупинені")
 
 
 def main():
@@ -389,3 +386,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
